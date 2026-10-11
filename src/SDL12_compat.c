@@ -985,6 +985,19 @@ static SDL_mutex *VideoRendererLock = NULL;
 static SDL_Texture *VideoTexture20 = NULL;
 static SDL12_Surface VideoSurface12Location;
 static SDL12_Surface *VideoSurface12 = NULL;
+
+/* Cogmind GPU console extension: implemented in cogmind_gpu.inc.c, #included at the end of this file. */
+static SDL_bool CogGPU_Active(void);
+static void CogGPU_Teardown(void);
+static void CogGPU_NewVideoMode(int width, int height);
+static void CogGPU_ForgetSurface(SDL12_Surface *s);
+static void CogGPU_NoteEvent(const SDL_Event *e);
+static int CogGPU_FillRect(SDL12_Surface *dst, SDL12_Rect *dstrect12, Uint32 color);
+static SDL_bool CogGPU_UpperBlit(SDL12_Surface *src12, SDL12_Rect *srcrect12, SDL12_Surface *dst12, SDL12_Rect *dstrect12, int *retval);
+static SDL_bool CogGPU_PresentBegin(SDL_Renderer *renderer);
+static SDL_bool CogGPU_Present(SDL_Renderer *renderer);
+static void CogGPU_RenderPresent(SDL_Renderer *renderer);
+static SDL_bool CogGPU_SkipUpload(void);
 static SDL_Palette *VideoPhysicalPalette20 = NULL;
 static Uint32 VideoSurfacePresentTicks = 0;
 static Uint32 VideoSurfaceLastPresentTicks = 0;
@@ -1248,7 +1261,10 @@ static SDL_bool SDL12COMPAT_CheckDebugLogging(void)
 static char loaderror[256];
 #if defined(_WIN32)
     #define DIRSEP "\\"
-    #define SDL20_LIBNAME "SDL2.dll"
+    /* Cogmind: the GPU build ships its SDL2 runtime as SDG2.dll so it can coexist with a stock SDL2.dll. */
+    #ifndef SDL20_LIBNAME
+    #define SDL20_LIBNAME "SDG2.dll"
+    #endif
     /* require SDL2 >= 2.0.12 for SDL_CreateThread binary compatibility */
     #define SDL20_REQUIRED_VER SDL_VERSIONNUM(2,0,12)
     static HMODULE Loaded_SDL20 = NULL;
@@ -4861,6 +4877,8 @@ EventFilter20to12(void *data, SDL_Event *event20)
 
     SDL_assert(data == NULL);  /* currently unused. */
 
+    CogGPU_NoteEvent(event20);  /* Cogmind: render-target / device resets invalidate the GPU screen */
+
     SDL20_zero(event12);
 
     switch (event20->type) {
@@ -5717,6 +5735,7 @@ SDL_FreeSurface(SDL12_Surface *surface12)
         surface12->refcount--;
         if (surface12->refcount)
             return;
+        CogGPU_ForgetSurface(surface12);  /* Cogmind: drop the font atlas keyed by this pointer */
         FreeSurfaceContents(surface12);
         SDL20_free(surface12);
     }
@@ -5747,7 +5766,11 @@ DECLSPEC12 int SDLCALL
 SDL_FillRect(SDL12_Surface *dst, SDL12_Rect *dstrect12, Uint32 color)
 {
     SDL_Rect dstrect20;
-    const int retval = SDL20_FillRect(dst->surface20, dstrect12 ? Rect12to20(dstrect12, &dstrect20) : NULL, color);
+    int retval;
+    if ((dst == VideoSurface12) && CogGPU_Active()) {  /* Cogmind: the screen lives on the GPU */
+        return CogGPU_FillRect(dst, dstrect12, color);
+    }
+    retval = SDL20_FillRect(dst->surface20, dstrect12 ? Rect12to20(dstrect12, &dstrect20) : NULL, color);
     if (retval == 0) {
         if (dstrect12) {  /* 1.2 stores the clip intersection in dstrect */
             SDL_Rect intersected20;
@@ -6007,6 +6030,7 @@ EndVidModeCreate(void)
         OpenGLFuncs.glDeleteTextures(1, &OpenGLBlitTexture);
         OpenGLBlitTexture = 0;
     }
+    CogGPU_Teardown();  /* Cogmind: destroy the GPU screen and font atlases before their renderer goes away */
     if (VideoTexture20) {
         SDL20_DestroyTexture(VideoTexture20);
         VideoTexture20 = NULL;
@@ -6584,6 +6608,8 @@ SetVideoModeImpl(int width, int height, int bpp, Uint32 flags12)
         }
     }
 
+    CogGPU_NewVideoMode(width, height);  /* Cogmind: invalidates the GPU screen; drops a CPU texture of the wrong size (resize bug) */
+
     if (flags12 & SDL12_FULLSCREEN) {
         /* For software rendering, we're just going to push it off onto the
             GPU, so use FULLSCREEN_DESKTOP and logical scaling there.
@@ -7058,6 +7084,12 @@ SDL_UpperBlit(SDL12_Surface *src12, SDL12_Rect *srcrect12, SDL12_Surface *dst12,
         return SDL20_SetError("SDL_UpperBlit: passed a surface with NULL pixels");
     }
 
+    if (CogGPU_Active() && ((src12 == VideoSurface12) || (dst12 == VideoSurface12))) {  /* Cogmind: screen is on the GPU */
+        if (CogGPU_UpperBlit(src12, srcrect12, dst12, dstrect12, &retval)) {
+            return retval;
+        }
+    }
+
     PrepBlitDestRect(&dstrect20, dst12, dstrect12);
 
     if (SaveDestAlpha(src12, dst12, &dstrect20, &dstalpha) < 0) {
@@ -7290,8 +7322,15 @@ PresentScreen(void)
         SDL_PumpEvents();
     }
 
+    if (CogGPU_PresentBegin(renderer)) {  /* Cogmind: GPU screen unchanged since the last present: nothing to draw; else draws the recorded cells */
+        VideoSurfaceUpdatedInBackgroundThread = SDL_FALSE;
+        UnlockVideoRenderer();
+        return;
+    }
     SDL20_RenderClear(renderer);
-    SDL20_RenderCopy(renderer, VideoTexture20, NULL, NULL);
+    if (!CogGPU_Present(renderer)) {  /* Cogmind: draws the GPU screen (and handles COGGPU_DUMP) when there is one */
+        SDL20_RenderCopy(renderer, VideoTexture20, NULL, NULL);
+    }
 
     /* Render any pending YUV overlay over the surface texture. */
     overlay = QueuedDisplayOverlays.next;
@@ -7310,7 +7349,7 @@ PresentScreen(void)
         QueuedDisplayOverlaysTail = &QueuedDisplayOverlays;
     }
 
-    SDL20_RenderPresent(renderer);
+    CogGPU_RenderPresent(renderer);  /* Cogmind: SDL_RenderPresent + COGGPU_LOG statistics */
     VideoSurfaceUpdatedInBackgroundThread = SDL_FALSE;
     VideoSurfaceLastPresentTicks = SDL20_GetTicks();
 
@@ -7512,7 +7551,7 @@ SDL_UpdateRects(SDL12_Surface *surface12, int numrects, SDL12_Rect *rects12)
         for (i = 0; i < numrects; i++) {
             UpdateRect12to20(surface12, &rects12[i], &rect20, &whole_screen);
 
-            if (!renderer) {
+            if (!renderer || CogGPU_SkipUpload()) {  /* Cogmind: no CPU texture upload when the screen lives on the GPU */
                 continue;
             }
             if (!rect20.w || !rect20.h) {
@@ -10458,6 +10497,9 @@ X11_KeyToUnicode(SDL12Key key, SDL12Mod mod)
     return (Uint16) key;
 }
 #endif
+
+/* Cogmind GPU console extension (COGGPU_* exports and the CogGPU_* hooks declared near VideoSurface12). */
+#include "cogmind_gpu.inc.c"
 
 #ifdef __cplusplus
 }
