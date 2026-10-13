@@ -998,6 +998,16 @@ static SDL_bool CogGPU_PresentBegin(SDL_Renderer *renderer);
 static SDL_bool CogGPU_Present(SDL_Renderer *renderer);
 static void CogGPU_RenderPresent(SDL_Renderer *renderer);
 static SDL_bool CogGPU_SkipUpload(void);
+static void CogGPU_PollEnter(void);
+static void CogGPU_PollLeave(const SDL12_Event *event12, int ret);
+static void CogGPU_FlipEnter(void);
+static void CogGPU_FlipLeave(void);
+static SDL_bool CogGPU_Delay(const void *retaddr, Uint32 ticks);
+/* Cogmind 3D / VR view: implemented in cogmind_vr.inc.c (read-only tap of the mixed audio output for its beat tracker). */
+static void CogVR_AudioTap(const Uint8 *stream, int len, const SDL_AudioSpec *spec);
+static void CogVR_MusicMix(Uint8 *stream, int len, const SDL_AudioSpec *spec);   /* in-engine music player (COGVR_MUSIC) */
+static void CogVR_BridgePoll(void);
+static SDL_bool CogGPU_WantVsync(void);
 static SDL_Palette *VideoPhysicalPalette20 = NULL;
 static Uint32 VideoSurfacePresentTicks = 0;
 static Uint32 VideoSurfaceLastPresentTicks = 0;
@@ -1709,6 +1719,30 @@ SDL12Compat_ApplyQuirks(SDL_bool force_x11)
     }
 }
 
+#ifdef _WIN32
+/* SDL 1.2's Windows DLL was built with mingw against msvcrt.dll, so SDL_LoadWAV_RW, SDL_FreeWAV and SDL_malloc/SDL_free used
+   msvcrt's heap, and 1.2-era code mixes those freely with its own malloc/free. SDL_mixer 1.2 (msvcrt) mallocs every Ogg/VOC/AIFF
+   sample itself and hands it to SDL_FreeWAV after conversion, and Cogmind builds pitch-shifted Mix_Chunks with msvcrt's malloc
+   (fetched with GetProcAddress) for SDL_mixer to free. SDL2 has its own heap (dlmalloc in the official DLL, the UCRT in a mingw
+   build), so each of those frees lands on the wrong heap. Give SDL2 msvcrt's allocator and it is one heap again, as in 1.2.
+   Must run before the first SDL2 call that can allocate (SDL_GetVersion can, through SDL_getenv), and only while SDL2 owns no
+   memory yet (a shared SDL2.dll may already be in use). Without msvcrt.dll in the process there is nothing to be compatible with. */
+static void
+UseMsvcrtHeap(void)
+{
+    const HMODULE msvcrt = GetModuleHandleA("msvcrt.dll");
+    if (msvcrt && (SDL20_GetNumAllocations() == 0)) {
+        SDL_malloc_func malloc_fn = (SDL_malloc_func) (void *) GetProcAddress(msvcrt, "malloc");
+        SDL_calloc_func calloc_fn = (SDL_calloc_func) (void *) GetProcAddress(msvcrt, "calloc");
+        SDL_realloc_func realloc_fn = (SDL_realloc_func) (void *) GetProcAddress(msvcrt, "realloc");
+        SDL_free_func free_fn = (SDL_free_func) (void *) GetProcAddress(msvcrt, "free");
+        if (malloc_fn && calloc_fn && realloc_fn && free_fn) {
+            SDL20_SetMemoryFunctions(malloc_fn, calloc_fn, realloc_fn, free_fn);
+        }
+    }
+}
+#endif
+
 /* DO NOT CALL THINGS THAT USE SDL ALLOCATORS HERE. It runs before main(), so app-supplied allocators are not set at this point.
    This means no SDL_Log, no hint subsystem, nothing that might call SDL_SetError! In fact, favor code in this file, using
    platform-specific #ifdefs, to calling into SDL2 at all, if you can help it. */
@@ -1743,6 +1777,11 @@ LoadSDL20(void)
         } else {
             #define SDL20_SYM(rc,fn,params,args,ret) SDL20_##fn = (SDL20_##fn##_t) LoadSDL20Symbol("SDL_" #fn, &okay);
             #include "SDL20_syms.h"
+            #ifdef _WIN32
+            if (okay) {
+                UseMsvcrtHeap();  /* first SDL2 call: nothing may allocate before it */
+            }
+            #endif
             if (okay) {
                 char sdl2verstr[16];
                 char sdl2reqverstr[16];
@@ -3189,9 +3228,13 @@ SDL_PollEvent(SDL12_Event *event12)
         return 0;
     }
 
+    CogGPU_PollEnter();  /* Cogmind: start of the app's event drain: frame pacer + loop statistics */
+
     SDL20_LockMutex(EventQueueMutex);
     retval = SDL_PollEvent_locked(event12);
     SDL20_UnlockMutex(EventQueueMutex);
+
+    CogGPU_PollLeave(event12, retval);  /* Cogmind: notice the synthetic key of COGGPU_INJECT */
 
     return retval;
 }
@@ -6812,7 +6855,7 @@ SetVideoModeImpl(int width, int height, int bpp, Uint32 flags12)
     } else {
         /* always use a renderer for non-OpenGL windows. */
         const char *old_scale_quality = SDL20_GetHint(SDL_HINT_RENDER_SCALE_QUALITY);
-        const SDL_bool want_vsync = (vsync_env && SDL20_atoi(vsync_env)) ? SDL_TRUE : SDL_FALSE;
+        const SDL_bool want_vsync = ((vsync_env && SDL20_atoi(vsync_env)) || CogGPU_WantVsync()) ? SDL_TRUE : SDL_FALSE;  /* Cogmind: COGGPU_PACE=vsync */
         SDL_RendererInfo rinfo;
         SDL_assert(!VideoGLContext20);  /* either a new window or we destroyed all this */
 
@@ -7630,7 +7673,9 @@ DECLSPEC12 int SDLCALL
 SDL_Flip(SDL12_Surface *surface12)
 {
     if (surface12 == VideoSurface12) {
+        CogGPU_FlipEnter();  /* Cogmind: loop statistics, COGGPU_INJECT */
         SDL_UpdateRect(surface12, 0, 0, 0, 0);  /* update the whole screen and present now. */
+        CogGPU_FlipLeave();
     }
 
     return 0;
@@ -8675,6 +8720,10 @@ SDL_Delay(Uint32 ticks)
         } else if (VideoSurfacePresentTicks) {
             PresentScreen();
         }
+    }
+
+    if (CogGPU_Delay(__builtin_return_address(0), ticks)) {  /* Cogmind: COGGPU_PACE swallows the game's own frame limiter sleep */
+        return;
     }
 
     SDL20_Delay(ticks);
@@ -9945,6 +9994,8 @@ AudioCallbackWrapper(void *userdata, Uint8 *stream, int len)
     }
 
     FakeCdRomAudioCallback(data, stream, len, must_mix);
+    CogVR_MusicMix(stream, len, &data->device_format);  /* Cogmind 3D view: the music player, before the tap so the beat tracker hears it */
+    CogVR_AudioTap(stream, len, &data->device_format);  /* Cogmind 3D view: read-only beat tracking of the mixed output */
 }
 
 
@@ -10500,6 +10551,9 @@ X11_KeyToUnicode(SDL12Key key, SDL12Mod mod)
 
 /* Cogmind GPU console extension (COGGPU_* exports and the CogGPU_* hooks declared near VideoSurface12). */
 #include "cogmind_gpu.inc.c"
+/* Cogmind 3D / VR map view (COGVR_* exports, own render thread). */
+#include "cogmind_vr.inc.c"
+#include "cogmind_vrbridge.inc.c"
 
 #ifdef __cplusplus
 }

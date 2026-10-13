@@ -96,15 +96,14 @@ static struct CogGPUState {
     /* diagnostics, only touched when COGGPU_LOG is set */
     int endCalls;
     double tGeom;                      /* ms inside RenderGeometryRaw during the current flush */
-    double tPresent0;                  /* PresentScreen start */
-    double winT0;                      /* start of the current 2 s window */
-    int winPresents; double winPresentMs;
-    int winFlushes, winCells; double winFlushMs, winFlushMax;
+    int winFlushes, winCells; double winFlushMs, winFlushMax;   /* per 2 s window, emitted by CogPace_Emit() */
     int winSkipped;
 } CogGPU;
 
 static SDL_bool CogGPU_MakeAtlasTexture(SDL_Renderer *renderer, CogGPUAtlas *a);
-static void CogGPU_PresentDone(void);
+static SDL_bool CogPace_SkipAllowed(void);   /* cogmind_pace.inc.c */
+static void CogPace_PresentStart(void);
+static void CogPace_PresentEnd(int real);
 static int CogGPU_UploadAtlas(CogGPUAtlas *a);
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -1532,14 +1531,11 @@ CogGPU_MaybeDump(void)
 static SDL_bool
 CogGPU_PresentBegin(SDL_Renderer *renderer)
 {
-    CogGPU_InitEnv();
-    if (CogGPU.logPath[0]) {
-        CogGPU.tPresent0 = CogGPU_Now();
-    }
+    CogPace_PresentStart();
     if (!CogGPU.target) {
         return SDL_FALSE;
     }
-    if (!CogGPU.dirty && !CogGPU.pend && !QueuedDisplayOverlays.next) {
+    if (!CogGPU.dirty && !CogGPU.pend && !QueuedDisplayOverlays.next && CogPace_SkipAllowed()) {
         const Uint32 now = SDL20_GetTicks();
         SDL_bool force = SDL_TRUE;
         if (!SDL_TICKS_PASSED(now, VideoSurfaceLastPresentTicks + COGGPU_HEARTBEAT_MS)) {
@@ -1552,10 +1548,8 @@ CogGPU_PresentBegin(SDL_Renderer *renderer)
             }
         }
         if (!force) {
-            if (CogGPU.logPath[0]) {
-                CogGPU.winSkipped++;
-                CogGPU_PresentDone();
-            }
+            CogGPU.winSkipped++;
+            CogPace_PresentEnd(0);
             return SDL_TRUE;
         }
     }
@@ -1579,41 +1573,6 @@ CogGPU_Present(SDL_Renderer *renderer)
     return SDL_TRUE;
 }
 
-/* 3. in place of SDL_RenderPresent(): same call, plus the COGGPU_LOG statistics (both in GPU and in software mode, so the two
-   can be compared): every ~2 s one PRESENT line (PresentScreen calls, fps, mean cost of PresentScreen in ms incl. drawing the
-   recorded cells; skipped presents count as frames with ~0 ms), and in GPU mode one FLUSH line (cell drawing) and, if any,
-   one SKIP line. Two clock reads per present when COGGPU_LOG is set, none otherwise. */
-static void
-CogGPU_PresentDone(void)
-{
-    const double now = CogGPU_Now();
-    if (CogGPU.winT0 == 0.0) {
-        CogGPU.winT0 = CogGPU.tPresent0;
-    }
-    CogGPU.winPresents++;
-    CogGPU.winPresentMs += now - CogGPU.tPresent0;
-    if (now - CogGPU.winT0 >= 2000.0) {
-        const double secs = (now - CogGPU.winT0) / 1000.0;
-        CogGPU_Log("PRESENT frames=%d fps=%.1f avgFlipMs=%.3f gpuScreen=%d", CogGPU.winPresents, CogGPU.winPresents / secs,
-                   CogGPU.winPresentMs / CogGPU.winPresents, CogGPU.target ? 1 : 0);
-        if (CogGPU.winFlushes) {
-            CogGPU_Log("FLUSH flushes=%d avgCells=%.1f avgFlushMs=%.3f maxFlushMs=%.3f", CogGPU.winFlushes,
-                       (double) CogGPU.winCells / CogGPU.winFlushes, CogGPU.winFlushMs / CogGPU.winFlushes, CogGPU.winFlushMax);
-        }
-        if (CogGPU.winSkipped) {
-            CogGPU_Log("SKIP presents=%d", CogGPU.winSkipped);
-        }
-        CogGPU.winT0 = now;
-        CogGPU.winPresents = CogGPU.winFlushes = CogGPU.winCells = CogGPU.winSkipped = 0;
-        CogGPU.winPresentMs = CogGPU.winFlushMs = CogGPU.winFlushMax = 0.0;
-    }
-}
+/* 3. in place of SDL_RenderPresent(): see CogGPU_RenderPresent in cogmind_pace.inc.c (same call + statistics + pacer bookkeeping) */
 
-static void
-CogGPU_RenderPresent(SDL_Renderer *renderer)
-{
-    SDL20_RenderPresent(renderer);
-    if (CogGPU.logPath[0]) {
-        CogGPU_PresentDone();
-    }
-}
+#include "cogmind_pace.inc.c"
