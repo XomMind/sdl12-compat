@@ -601,7 +601,7 @@ CogVRAuto_Fail(double now)
     const int g = CogVRAuto.glyph[i];
     CogVRAuto.fails_n++;
     if (CogVRAuto.fails[i] < 255) { CogVRAuto.fails[i]++; }
-    CogVRAuto.blockUntil[i] = now + ((CogVRAuto.fails[i] >= 3) ? 1e12 : 8000.0 * CogVRAuto.fails[i]);
+    CogVRAuto.blockUntil[i] = now + ((CogVRAuto.cls[i] == COGVR_AP_ROBOT) ? 3000.0 : 4000.0 * ((CogVRAuto.fails[i] < 5) ? CogVRAuto.fails[i] : 5));   /* never for good: a robot may have moved on */
     CogVR_Log("COGVR autopilot: move %d,%d -> %d,%d failed (glyph %d, cls %d, fail %d)", CogVRAuto.sentX, CogVRAuto.sentY,
               CogVRAuto.toX, CogVRAuto.toY, g, CogVRAuto.cls[i], CogVRAuto.fails[i]);
     /* a glyph that stops moves on two different cells is terrain we cannot walk (machines, closed walls) */
@@ -616,9 +616,10 @@ CogVRAuto_Fail(double now)
 }
 
 /* BFS from the player over walkable known cells: the nearest exit, else the nearest unvisited cell next to the unknown.
+   Visible robots are walls unless `bump` (boxed in by them: walk into one and let the game decide what happens).
    Returns the first step (dx,dy) through *sx,*sy, or 0 when there is nowhere to go. */
 static int
-CogVRAuto_Plan(double now, int *sx, int *sy)
+CogVRAuto_Plan(double now, int bump, int *sx, int *sy)
 {
     static const int ddx[8] = { 0, 1, 1, 1, 0, -1, -1, -1 }, ddy[8] = { -1, -1, 0, 1, 1, 1, 0, -1 };
     const int W = CogVRAuto.W, H = CogVRAuto.H, start = CogVRAuto.px * H + CogVRAuto.py;
@@ -648,7 +649,7 @@ CogVRAuto_Plan(double now, int *sx, int *sy)
             if ((nx < 0) || (ny < 0) || (nx >= W) || (ny >= H)) { continue; }
             ni = nx * H + ny;
             c = CogVRAuto.cls[ni];
-            if ((CogVRAuto.dist[ni] >= 0) || ((c != COGVR_AP_FLOOR) && (c != COGVR_AP_EXIT)) || (CogVRAuto.blockUntil[ni] > now)) { continue; }
+            if ((CogVRAuto.dist[ni] >= 0) || ((c != COGVR_AP_FLOOR) && (c != COGVR_AP_EXIT) && !(bump && (c == COGVR_AP_ROBOT))) || (CogVRAuto.blockUntil[ni] > now)) { continue; }
             CogVRAuto.dist[ni] = CogVRAuto.dist[cur] + 1;
             CogVRAuto.queue[tail++] = ni;
         }
@@ -759,10 +760,10 @@ CogVRAuto_Poll(void)
         }
         return;
     }
-    if (!CogVRAuto_Plan(now, &sx, &sy)) {
+    if (!CogVRAuto_Plan(now, 0, &sx, &sy) && !CogVRAuto_Plan(now, 1, &sx, &sy)) {
         int i, any = 0;
         for (i = 0; i < CogVRAuto.W * CogVRAuto.H; i++) {
-            if ((CogVRAuto.blockUntil[i] > now) && (CogVRAuto.blockUntil[i] < 1e11)) { CogVRAuto.blockUntil[i] = 0; any = 1; }
+            if (CogVRAuto.blockUntil[i] > now) { CogVRAuto.blockUntil[i] = 0; any = 1; }
         }
         if (!any) {
             /* everything reachable is explored: revisit (the view may have missed cells) */
