@@ -192,6 +192,7 @@ static struct CogVRState {
     float cruiseX, cruiseY, cruiseV, vignetteStrength, vignette, postEye;
     int started;
     int inPass, passW, passH;
+    int passEvery, passPublish;        /* this pass: every frame (recorder/autopilot); the renderer's slot is due */
     double nextSlot;
     Uint32 version;
     SDL_mutex *mutex;
@@ -3878,6 +3879,14 @@ static void CogVR_MusicMix(Uint8 *stream, int len, const SDL_AudioSpec *spec) { 
 /* exports (game thread)                                                                                          */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+/* cogmind_vrrec.inc.c (game thread): the recorder and the autopilot see every snapshot, not only the renderer's */
+#ifdef _WIN32
+static int CogVRRec_Wanted(void);
+static int CogVRAuto_Wanted(void);
+static void CogVRRec_Frame(const COGVR_Header *h, const COGVR_Cell *cells);
+static void CogVRAuto_Frame(const COGVR_Header *h, const COGVR_Cell *cells);
+#endif
+
 DECLSPEC12 int SDLCALL
 COGVR_Abi(void)
 {
@@ -3901,17 +3910,22 @@ COGVR_Begin(int mapW, int mapH)
     if (!CogVR.started) {
         CogVR_Start();
     }
-    if (CogVR.rstate != COGVR_RUNNING) {
+    /* the recorder and the autopilot take every frame; the renderer gets one every 1/COGVR_MAXRATE s */
+    CogVR.passEvery = CogVRRec_Wanted() | CogVRAuto_Wanted();
+    if ((CogVR.rstate != COGVR_RUNNING) && !CogVR.passEvery) {
         return NULL;
     }
     /* throttle: slots every 1/COGVR_MAXRATE s, the first frame at or after a slot takes it, no catch-up */
     now = CogGPU_Now();
-    if (now < CogVR.nextSlot) {
+    CogVR.passPublish = (CogVR.rstate == COGVR_RUNNING) && (now >= CogVR.nextSlot);
+    if (!CogVR.passPublish && !CogVR.passEvery) {
         return NULL;
     }
-    CogVR.nextSlot += period;
-    if (CogVR.nextSlot < now) {
-        CogVR.nextSlot = now + period;
+    if (CogVR.passPublish) {
+        CogVR.nextSlot += period;
+        if (CogVR.nextSlot < now) {
+            CogVR.nextSlot = now + period;
+        }
     }
     s = &CogVR.slot[CogVR.wIdx];
     need = (size_t) mapW * (size_t) mapH;
@@ -3946,6 +3960,14 @@ COGVR_End(const COGVR_Header *header)
     if (!header || (header->mapW != CogVR.passW) || (header->mapH != CogVR.passH)) {
         return;
     }
+    if (CogVR.passEvery) {
+        CogVRRec_Frame(header, CogVR.slot[CogVR.wIdx].cells);
+        CogVRAuto_Frame(header, CogVR.slot[CogVR.wIdx].cells);
+    }
+    CogVR_SaveHeader(header);
+    if (!CogVR.passPublish) {
+        return;   /* recorded only: the renderer's slot was not due, the write buffer is reused */
+    }
     CogVR.slot[CogVR.wIdx].hdr = *header;
     CogVR.slot[CogVR.wIdx].version = ++CogVR.version;
     SDL20_LockMutex(CogVR.mutex);
@@ -3954,7 +3976,6 @@ COGVR_End(const COGVR_Header *header)
     CogVR.wIdx = t;
     CogVR.fresh = 1;
     SDL20_UnlockMutex(CogVR.mutex);
-    CogVR_SaveHeader(header);
 #else
     (void) header;
 #endif

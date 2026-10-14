@@ -259,6 +259,8 @@ CogVRBridge_Click(const COGVR_Header *h, int x, int y, int press)
     if (CogVRBridge.log) { CogVR_Log("COGVR bridge: click cell=%d,%d pixel=%d,%d frame=%u",x,y,px,py,CogVRBridge.frame); }
 }
 
+static void CogVRAuto_Poll(void);   /* cogmind_vrrec.inc.c */
+
 static void
 CogVR_BridgePoll(void)
 {
@@ -267,6 +269,7 @@ CogVR_BridgePoll(void)
     COGVR_Header hdr;
     double now;
     int dir = -1;
+    CogVRAuto_Poll();   /* autopilot + recorder notes: independent of the 3D view's input */
     if (!CogVRBridge.initialized) { CogVRBridge_Init(); }
     CogVR_GetBridgeInput(&in);
     if (!in.valid || !CogVR_GetLastHeader(&hdr)) {
@@ -341,6 +344,10 @@ CogVR_BridgePoll(void)
     }
     CogVRBridge.previous = in;
 }
+
+#include "cogmind_vrrec.inc.c"
 #else
 static void CogVR_BridgePoll(void) { }
+static void CogVR_ScreenCells(const COGGPU_Cell *c, int n, int cw, int chh) { (void) c; (void) n; (void) cw; (void) chh; }
+static int CogVR_RealInputBlocked(const SDL_Event *event20) { (void) event20; return 0; }
 #endif

@@ -343,6 +343,8 @@ CogVRMusic_Command(int what)
     }
 }
 
+static void CogVRRec_MusicTitle(const char *title);   /* cogmind_vrrec.inc.c: a music EVENT in the recording */
+
 static void
 CogVRMusic_WriteNow(void)
 {
@@ -354,6 +356,9 @@ CogVRMusic_WriteNow(void)
     n = SDL20_snprintf(text, sizeof (text), "NOW  %s\r\nNEXT %s\r\n", (cur >= 0) ? CogVRMusic.title[cur] : "-",
                        ((cur + 1 >= 1) && (cur + 1 < CogVRMusic.n)) ? CogVRMusic.title[cur + 1] : "-");
     CogVR_Log("COGVR music: now %s", (cur >= 0) ? CogVRMusic.title[cur] : "-");
+    if (cur >= 0) {
+        CogVRRec_MusicTitle(CogVRMusic.title[cur]);
+    }
     if (!CogVRMusic.nowFile[0] || (n <= 0) || (n >= (int) sizeof (text))) {
         return;
     }

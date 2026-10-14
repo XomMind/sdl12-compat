@@ -102,6 +102,8 @@ static struct CogGPUState {
 
 static SDL_bool CogGPU_MakeAtlasTexture(SDL_Renderer *renderer, CogGPUAtlas *a);
 static SDL_bool CogPace_SkipAllowed(void);   /* cogmind_pace.inc.c */
+/* cogmind_vrrec.inc.c: the text the screen shows (HUD location/core for the recorder and autopilot); game thread */
+static void CogVR_ScreenCells(const COGGPU_Cell *c, int n, int cw, int chh);
 static void CogPace_PresentStart(void);
 static void CogPace_PresentEnd(int real);
 static int CogGPU_UploadAtlas(CogGPUAtlas *a);
@@ -1203,6 +1205,7 @@ COGGPU_End(int count, int cellW, int cellH)
     CogGPU.batches[CogGPU.nbatches].ch = cellH;
     CogGPU.nbatches++;
     CogGPU.dirty = 1;
+    CogVR_ScreenCells(CogGPU.cells + CogGPU.pend, count, cellW, cellH);
     CogGPU.pend += count;
     if (count > CogGPU.maxBatch) {
         CogGPU.maxBatch = count;

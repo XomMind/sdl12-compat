@@ -1007,6 +1007,7 @@ static SDL_bool CogGPU_Delay(const void *retaddr, Uint32 ticks);
 static void CogVR_AudioTap(const Uint8 *stream, int len, const SDL_AudioSpec *spec);
 static void CogVR_MusicMix(Uint8 *stream, int len, const SDL_AudioSpec *spec);   /* in-engine music player (COGVR_MUSIC) */
 static void CogVR_BridgePoll(void);
+static int CogVR_RealInputBlocked(const SDL_Event *event20);   /* cogmind_vrrec.inc.c: COGVR_AUTOPILOT owns the keyboard */
 static SDL_bool CogGPU_WantVsync(void);
 static SDL_Palette *VideoPhysicalPalette20 = NULL;
 static Uint32 VideoSurfacePresentTicks = 0;
@@ -4921,6 +4922,9 @@ EventFilter20to12(void *data, SDL_Event *event20)
     SDL_assert(data == NULL);  /* currently unused. */
 
     CogGPU_NoteEvent(event20);  /* Cogmind: render-target / device resets invalidate the GPU screen */
+    if (CogVR_RealInputBlocked(event20)) {
+        return 1;   /* Cogmind autopilot run: stray desktop keys/mouse never reach the game */
+    }
 
     SDL20_zero(event12);
 
