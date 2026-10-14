@@ -2,19 +2,20 @@
  * cogmind_vrrec.inc.c -- snapshot recorder (COGVR_RECORD) and autopilot (COGVR_AUTOPILOT). Game thread, except
  * CogVRRec_MusicTitle (render thread). Included at the end of cogmind_vrbridge.inc.c (uses its key injection).
  *
- *   COGVR_RECORD=<file>        append every changed snapshot to a .cogrec file (format below)
- *   COGVR_AUTOPILOT=1          walk Cogmind out of the current map, then out of the next one ... until the first map
- *                              after Materials (COGVR_AUTOPILOT_DEPTH, default -10) is reached; COGVR_AUTOPILOT_MS = cadence
+ *   COGVR_RECORD=<file>        create/overwrite a .cogrec file and record every changed fair-view display snapshot
+ *   COGVR_AUTOPILOT=1          attempt to leave the current map and subsequent maps until the first map after
+ *                              COGVR_AUTOPILOT_DEPTH (default -10); COGVR_AUTOPILOT_MS = cadence
  *
  * Both see only what the player sees: the snapshot (cogmind_vr.h fairness invariant) and the text of the 2D screen as
  * the GPU console draws it (HUD "Loc: -11/???", "Core 250/250"). The autopilot injects only ordinary key presses
- * (numpad moves, '>' on an exit), exactly like the VR bridge; retail decides what they do.
+ * (numpad moves, '<' on an exit), exactly like the VR bridge; retail decides what they do. Cogmind climbs: the way on is '<'
+ * (up stairs), '>' is the way back to where you came from and is just floor to the planner.
  *
  * .cogrec, little-endian: "COGREC1\n" | u32 abi (COGVR_ABI) | u32 sizeof(COGVR_Header) | u32 sizeof(COGVR_Cell), then
  * records until EOF: u8 kind | u8[3] 0 | u32 t_ms since the start | i32 depth (HUD, 0 unknown) | COGVR_Header | u32 n | payload
  *   kind 0 KEY:   n = mapW*mapH cells (column-major x*mapH+y, as the snapshot buffer)
  *   kind 1 DELTA: n x (u32 index, COGVR_Cell): cells changed since the previous record (same dims and depth)
- *   kind 2 EVENT: header zeroed, n bytes of UTF-8 text ("depth -10 Materials", "autopilot: exit reached", "music: ...")
+ *   kind 2 EVENT: header zeroed, n bytes of UTF-8 text ("depth -10 ???", "autopilot: exit reached", "music: ...")
  * A record is written when gameTick or any cell changed; a KEY at least every COGVR_REC_KEYEVERY records.
  */
 
@@ -34,9 +35,12 @@ static struct {
     char locName[40];
     int core, coreMax;                 /* "Core 250/250", -1 unknown */
     int turn;                          /* "Time: 1", -1 unknown */
+    int volley;                        /* the "V O L L E Y" panel is up: Cogmind is aiming (a targeting mode), not walking */
+    int hostiles;                      /* "< 2 HOSTILES >" on the log panel's border: hostile robots in view */
     int loggedProbe;
     double firstAt;                    /* first screen cells seen */
-} CogVRScr = { { { 0 } }, 0, 0, 0.0, 0, 0, { 0 }, -1, -1, -1, 0, 0.0 };
+    int dead;                          /* "CORE DESTROYED" was drawn */
+} CogVRScr = { { { 0 } }, 0, 0, 0.0, 0, 0, { 0 }, -1, -1, -1, 0, 0, 0, 0.0 };
 
 /* Glyph index -> character of Cogmind's text font (Beta 17.1 font sets, observed on the HUD): 0..32 = ' '..'@',
    33..42 = "[\]^_`{|}~", 64..89 = 'A'..'Z', 96..121 = 'a'..'z'; other slots hold the game's own symbols (1 here). */
@@ -117,8 +121,25 @@ CogVRScr_Parse(double now)
     }
     CogVRScr.dirty = 0;
     CogVRScr.parsedAt = now;
+    CogVRScr.volley = CogVRScr.hostiles = 0;
     for (r = 0; r < COGVR_SCR_ROWS; r++) {
         int c = CogVRScr_Find(r, "LOC:"), v, w;
+        if (CogVRScr_Find(r, "V O L L E Y") >= 0) { CogVRScr.volley = 1; }
+        if (CogVRScr_Find(r, "CORE DESTROYED") >= 0) { CogVRScr.dead = 1; }
+        {
+            /* "< 2 HOSTILES >" / "< 1 HOSTILE >"; the scan panel's "[1 - HOSTILE]" does not match */
+            int e = CogVRScr_Find(r, "HOSTILE"), p;
+            if (e >= 0) {
+                const int h0 = e - 7;
+                int n = 0, mul = 1;
+                p = h0 - 2;
+                if ((e < COGVR_SCR_COLS) && (CogVRScr.ch[r][e] == 'S' || CogVRScr.ch[r][e] == 's')) { e++; }
+                if ((h0 >= 3) && (e + 1 < COGVR_SCR_COLS) && (CogVRScr.ch[r][h0 - 1] == ' ') && (CogVRScr.ch[r][e] == ' ') && (CogVRScr.ch[r][e + 1] == '>')) {
+                    while ((p >= 0) && (CogVRScr.ch[r][p] >= '0') && (CogVRScr.ch[r][p] <= '9')) { n += (CogVRScr.ch[r][p] - '0') * mul; mul *= 10; p--; }
+                    if (mul > 1) { CogVRScr.hostiles = n; }
+                }
+            }
+        }
         if (c >= 0 && CogVRScr_Int(r, &c, &v) && (c < COGVR_SCR_COLS) && (CogVRScr.ch[r][c] == '/')) {
             int k = 0;
             c++;
@@ -435,8 +456,7 @@ static struct {
     Uint8 *visited, *fails;
     double *blockUntil;                /* temporary blocks after a failed move (robots, closed things) */
     int *dist, *queue;
-    Uint8 learned[256];                /* glyph codes found impassable: 2 failed moves on different cells */
-    Uint16 learnCell[256];
+    Uint8 learned[256];                /* machine glyphs (128+) that stopped a move twice on one cell: impassable */
     int px, py, havePlayer;
     int cadenceMs;
     double t0, nextAct, sentAt, lastMoveAt, doneAt, settleUntil;
@@ -448,6 +468,13 @@ static struct {
     int doneLogged;
     int prevCore;
     double histAt;
+    Uint32 tick;                       /* gameTick of the latest snapshot */
+    int nearRobot;                     /* Chebyshev distance to the nearest robot in view (99 none) */
+    double noFireUntil, tickAt;
+    Uint32 fireTick, seenTick;                 /* fireTick: the turn at which noTurnFs was last reset */
+    Uint32 frames, sentFrames, sentTick;       /* snapshots seen; at the last key sent: a key is judged only after frames passed / the HUD turn */
+    unsigned shots;
+    int gaveUp, exitDist, escs, noTurnFs;     /* noTurnFs: 'f' presses since the turn counter last moved */
 } CogVRAuto;
 
 static void
@@ -530,7 +557,7 @@ static int
 CogVRAuto_Classify(int ch, int flags)
 {
     if (!(flags & COGVR_KNOWN)) { return COGVR_AP_UNKNOWN; }
-    if (ch == '>') { return COGVR_AP_EXIT; }
+    if (ch == '<') { return COGVR_AP_EXIT; }
     if ((ch == '#') || ((ch < 256) && CogVRAuto.learned[ch])) { return COGVR_AP_WALL; }
     /* robots are letters; only a visible one is there now (remembered cells show terrain and items) */
     if ((flags & COGVR_VISIBLE) && (((ch >= 'A') && (ch <= 'Z')) || ((ch >= 'a') && (ch <= 'z')))) { return COGVR_AP_ROBOT; }
@@ -557,6 +584,9 @@ CogVRAuto_Frame(const COGVR_Header *h, const COGVR_Cell *cells)
         CogVRAuto.settleUntil = CogGPU_Now() + 1500.0;
     }
     CogVRAuto.known = known;
+    CogVRAuto.frames++;
+    CogVRAuto.tick = (Uint32) CogVRScr.turn;
+    CogVRAuto.nearRobot = 99;
     for (i = 0; i < n; i++) {
         const COGVR_Cell *c = &cells[i];
         if (c->flags & COGVR_PLAYER) {
@@ -564,6 +594,10 @@ CogVRAuto_Frame(const COGVR_Header *h, const COGVR_Cell *cells)
             continue;                        /* keep what was seen under Cogmind */
         }
         CogVRAuto.cls[i] = (Uint8) CogVRAuto_Classify(c->ch, c->flags);
+        if ((CogVRAuto.cls[i] == COGVR_AP_ROBOT) && (h->playerX >= 0)) {
+            const int ax = i / h->mapH - h->playerX, ay = i % h->mapH - h->playerY, dx = (ax < 0) ? -ax : ax, dy = (ay < 0) ? -ay : ay, d = (dx > dy) ? dx : dy;
+            if (d < CogVRAuto.nearRobot) { CogVRAuto.nearRobot = d; }
+        }
         if (c->flags & COGVR_KNOWN) { CogVRAuto.glyph[i] = c->ch ? c->ch : ' '; }
     }
     CogVRAuto.havePlayer = h->playerX >= 0 && h->playerY >= 0 && h->playerX < h->mapW && h->playerY < h->mapH;
@@ -599,19 +633,16 @@ CogVRAuto_Fail(double now)
 {
     const int i = CogVRAuto.toX * CogVRAuto.H + CogVRAuto.toY;
     const int g = CogVRAuto.glyph[i];
+    if (CogVRScr.volley) { return; }               /* the key went to the aiming mode, not to the legs */
     CogVRAuto.fails_n++;
     if (CogVRAuto.fails[i] < 255) { CogVRAuto.fails[i]++; }
     CogVRAuto.blockUntil[i] = now + ((CogVRAuto.cls[i] == COGVR_AP_ROBOT) ? 3000.0 : 4000.0 * ((CogVRAuto.fails[i] < 5) ? CogVRAuto.fails[i] : 5));   /* never for good: a robot may have moved on */
-    CogVR_Log("COGVR autopilot: move %d,%d -> %d,%d failed (glyph %d, cls %d, fail %d)", CogVRAuto.sentX, CogVRAuto.sentY,
-              CogVRAuto.toX, CogVRAuto.toY, g, CogVRAuto.cls[i], CogVRAuto.fails[i]);
-    /* a glyph that stops moves on two different cells is terrain we cannot walk (machines, closed walls) */
-    if ((g > ' ') && (g < 256) && (g != '>') && (CogVRAuto.cls[i] == COGVR_AP_FLOOR) && !CogVRAuto.learned[g]) {
-        if (CogVRAuto.learnCell[g] && (CogVRAuto.learnCell[g] != (Uint16) (i + 1))) {
-            CogVRAuto.learned[g] = 1;
-            CogVR_Log("COGVR autopilot: glyph %d '%c' is impassable", g, (g < 127) ? g : '?');
-        } else {
-            CogVRAuto.learnCell[g] = (Uint16) (i + 1);
-        }
+    CogVR_Log("COGVR autopilot: move %d,%d -> %d,%d failed (glyph %d, cls %d, fail %d, %d hostiles)", CogVRAuto.sentX, CogVRAuto.sentY,
+              CogVRAuto.toX, CogVRAuto.toY, g, CogVRAuto.cls[i], CogVRAuto.fails[i], CogVRScr.hostiles);
+    /* a machine glyph (the game's own symbols, 128+) that stopped us twice on one cell, in peace, is terrain we cannot walk */
+    if ((g >= 128) && (g < 256) && (CogVRAuto.fails[i] >= 2) && (CogVRScr.hostiles == 0) && (CogVRAuto.cls[i] == COGVR_AP_FLOOR) && !CogVRAuto.learned[g]) {
+        CogVRAuto.learned[g] = 1;
+        CogVR_Log("COGVR autopilot: glyph %d is impassable", g);
     }
 }
 
@@ -662,6 +693,7 @@ CogVRAuto_Plan(double now, int bump, int *sx, int *sy)
         }
     }
     CogVRAuto.targetExit = bestExit >= 0;
+    CogVRAuto.exitDist = (bestExit >= 0) ? CogVRAuto.dist[bestExit] : 99;
     if (best < 0) { return 0; }
     CogVRAuto.tx = best / H; CogVRAuto.ty = best % H;
     /* walk back to the first step */
@@ -700,6 +732,7 @@ CogVRAuto_Poll(void)
         CogVRAuto.t0 = now;
         CogVRAuto.settleUntil = now + 2000.0;
         CogVRRec_Event("autopilot: start at %d,%d depth %d %s", CogVRAuto.px, CogVRAuto.py, CogVRScr.depth, CogVRScr.locName);
+        CogVRAuto.tickAt = now;
     }
     if ((CogVRScr.core >= 0) && (CogVRScr.core != CogVRAuto.prevCore)) {
         if ((CogVRAuto.prevCore >= 0) && (CogVRScr.core < CogVRAuto.prevCore)) {
@@ -707,11 +740,23 @@ CogVRAuto_Poll(void)
         }
         CogVRAuto.prevCore = CogVRScr.core;
     }
+    /* the game stopped taking turns (dead, or stuck behind a window nobody answers): give up instead of waiting forever */
+    if (!CogVRAuto.done) {
+        if (CogVRAuto.tick != CogVRAuto.seenTick) {
+            CogVRAuto.seenTick = CogVRAuto.tick;
+            CogVRAuto.tickAt = now;
+        } else if (CogVRScr.dead || (now - CogVRAuto.tickAt > 45000.0)) {
+            CogVRAuto.done = CogVRAuto.gaveUp = 1;
+            CogVRAuto.doneAt = now;
+            CogVRRec_Event("autopilot: gave up, %s at depth %d %s (core %d)", CogVRScr.dead ? "core destroyed" : "no game turn for 45 s", CogVRScr.depth, CogVRScr.locName, CogVRScr.core);
+        }
+    }
     if (CogVRAuto.done) {
         if (!CogVRAuto.doneLogged && (now - CogVRAuto.doneAt > 4000.0)) {
             CogVRAuto.doneLogged = 1;
             CogVRRec_Flush();
-            CogVR_Log("COGVR autopilot: done (%u moves, %u failed, %.0f s)", CogVRAuto.moves, CogVRAuto.fails_n, (now - CogVRAuto.t0) / 1000.0);
+            CogVR_Log("COGVR autopilot: done%s (%u moves, %u failed, %u shots, %.0f s)", CogVRAuto.gaveUp ? " (gave up)" : "", CogVRAuto.moves,
+                      CogVRAuto.fails_n, CogVRAuto.shots, (now - CogVRAuto.t0) / 1000.0);
         }
         return;
     }
@@ -738,26 +783,77 @@ CogVRAuto_Poll(void)
             CogVRAuto.waiting = 0;
             CogVRAuto.moves++;
             CogVRAuto.lastMoveAt = now;
-        } else if (now - CogVRAuto.sentAt > 900.0) {
+        } else if ((CogVRAuto.tick != CogVRAuto.sentTick) && (CogVRAuto.frames - CogVRAuto.sentFrames >= 3)) {
+            /* a turn passed and we did not move: the cell is blocked (the game's own verdict; a key dropped while the game
+               pauses movement for new enemies, or sits in an animation, takes no turn and is simply sent again) */
             CogVRAuto.waiting = 0;
             CogVRAuto_Fail(now);
+        } else if (now - CogVRAuto.sentAt > 1600.0) {
+            /* no turn at all ("Invalid move": a friendly or neutral robot in the way, a dropped key): that cell waits a while */
+            CogVRAuto.waiting = 0;
+            CogVRAuto.blockUntil[CogVRAuto.toX * CogVRAuto.H + CogVRAuto.toY] = now + 6000.0;
         } else {
             return;
         }
     }
+    if (CogVRAuto.tick != CogVRAuto.fireTick) {
+        CogVRAuto.fireTick = CogVRAuto.tick;            /* a turn passed: whatever was sent took effect */
+        CogVRAuto.noTurnFs = 0;
+    }
     if (now < CogVRAuto.nextAct) { return; }
+    if (CogVRAuto.frames - CogVRAuto.sentFrames < 3) { return; }   /* the last key has not been through a frame yet */
+    if (CogVRAuto.noTurnFs >= 4) {
+        CogVRAuto.noFireUntil = now + 5000.0;           /* 'f' does nothing here (neutral robots, no line of fire): walk on */
+        CogVRAuto.noTurnFs = 0;
+    }
+    if (CogVRScr.volley) {
+        if ((CogVRScr.hostiles > 0) && (now >= CogVRAuto.noFireUntil) && !CogVRAuto.targetExit) {
+            /* the first 'f' picked a target and shows the volley: 'f' again fires it */
+            CogVRAuto.shots++;
+            CogVRAuto.noTurnFs++;
+            CogVRBridge_Key(SDLK12_f);
+            CogVRAuto.sentFrames = CogVRAuto.frames;
+            CogVRAuto.nextAct = now + CogVRAuto.cadenceMs;
+            return;
+        }
+        if (CogVRAuto.escs < 4) {
+            /* aiming mode with nothing to shoot at: Escape closes it; the moves would only steer its cursor */
+            CogVRAuto.escs++;
+            CogVR_Log("COGVR autopilot: aiming mode up (turn %d, %d hostiles): Escape", CogVRScr.turn, CogVRScr.hostiles);
+            CogVRBridge_Key(SDLK12_ESCAPE);
+            CogVRAuto.sentFrames = CogVRAuto.frames;
+            CogVRAuto.nextAct = now + 400.0;
+            return;
+        }
+        if (CogVRAuto.escs == 4) {
+            CogVRAuto.escs++;
+            CogVR_Log("COGVR autopilot: aiming mode will not close (turn %d)", CogVRScr.turn);
+        }
+    } else {
+        CogVRAuto.escs = 0;
+    }
     here = CogVRAuto.px * CogVRAuto.H + CogVRAuto.py;
-    if (CogVRAuto.glyph[here] == '>') {
-        /* on an exit: take it (the deck's STAIR key, Beta 17.1 manual binding) */
+    if (CogVRAuto.glyph[here] == '<') {
+        /* on an exit: take it ('<' = "Up stairs", Beta 17.1 manual; the deck's STAIR key sends '>' for the way down) */
         if (CogVRAuto.stairsTries++ == 0) {
             CogVRRec_Event("autopilot: on exit %d,%d depth %d, taking it", CogVRAuto.px, CogVRAuto.py, CogVRScr.depth);
         }
-        CogVRBridge_KeyEx(SDLK12_PERIOD, KMOD12_LSHIFT, '>');
+        CogVRBridge_KeyEx(SDLK12_COMMA, KMOD12_LSHIFT, '<');
+        CogVRAuto.sentFrames = CogVRAuto.frames;
         CogVRAuto.nextAct = now + 1500.0;
         if (CogVRAuto.stairsTries > 4) {
             CogVRAuto.blockUntil[here] = now + 30000.0;   /* not an exit we can take: move on */
             CogVRAuto.stairsTries = 0;
         }
+        return;
+    }
+    /* hostile robots in view: shoot ('f' = all weapons at the nearest target) while the way out is unknown; once it is known, run for it */
+    if ((CogVRScr.hostiles > 0) && (now >= CogVRAuto.noFireUntil) && !CogVRAuto.targetExit) {
+        CogVRAuto.noTurnFs++;
+        CogVRAuto.shots++;
+        CogVRBridge_Key(SDLK12_f);
+        CogVRAuto.sentFrames = CogVRAuto.frames;
+        CogVRAuto.nextAct = now + CogVRAuto.cadenceMs;
         return;
     }
     if (!CogVRAuto_Plan(now, 0, &sx, &sy) && !CogVRAuto_Plan(now, 1, &sx, &sy)) {
@@ -770,6 +866,7 @@ CogVRAuto_Poll(void)
             SDL20_memset(CogVRAuto.visited, 0, (size_t) CogVRAuto.W * (size_t) CogVRAuto.H);
             CogVR_Log("COGVR autopilot: nothing left to explore at %d,%d; waiting a turn", CogVRAuto.px, CogVRAuto.py);
             CogVRBridge_Key(SDLK12_PERIOD);
+            CogVRAuto.sentFrames = CogVRAuto.frames;
         }
         CogVRAuto.nextAct = now + 500.0;
         return;
@@ -778,6 +875,8 @@ CogVRAuto_Poll(void)
     CogVRAuto.toX = CogVRAuto.px + sx; CogVRAuto.toY = CogVRAuto.py + sy;
     CogVRAuto.waiting = 1;
     CogVRAuto.sentAt = now;
+    CogVRAuto.sentTick = CogVRAuto.tick;
     CogVRAuto.nextAct = now + CogVRAuto.cadenceMs;
     CogVRBridge_Key(moveKey[sy + 1][sx + 1]);
+    CogVRAuto.sentFrames = CogVRAuto.frames;
 }
