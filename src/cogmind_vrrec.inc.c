@@ -441,6 +441,172 @@ CogVRRec_Frame(const COGVR_Header *h, const COGVR_Cell *cells)
     }
 }
 
+/* Explicit offline retail rehearsal. No reconstructed C++ object is instantiated.
+   These fingerprints are from the actual GPU retail image, not a matching DLL.
+   PollEnter owns activation/input; the damage observer only counts the game's
+   existing player+god early-return branch and preserves its xor/jmp semantics. */
+static struct {
+    int init, on, stage, before, damage, reported;
+    unsigned attempts;
+    DWORD thread;
+    double next;
+    UINT_PTR entity, world;
+} CogVRAssist;
+
+static int
+CogVRAssist_Match(UINT_PTR address, const Uint8 *bytes, size_t n)
+{
+    return SDL20_memcmp((const void *) address, bytes, n) == 0;
+}
+
+static LONG CALLBACK
+CogVRAssist_Damage(EXCEPTION_POINTERS *e)
+{
+    CONTEXT *c = e->ContextRecord;
+    if ((e->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT) ||
+        ((UINT_PTR) e->ExceptionRecord->ExceptionAddress != 0x5e55a0) ||
+        (GetCurrentThreadId() != CogVRAssist.thread)) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    /* EBP and the entity local belong to the fingerprinted retail stack frame. */
+    if (*(int *) (c->Ebp + 0x14) > 0) {
+        CogVRAssist.entity = *(UINT_PTR *) (c->Ebp - 0x17d4);
+        CogVRAssist.world = *(UINT_PTR *) 0xcefc4c;
+        CogVRAssist.before = *(int *) (CogVRAssist.entity + 0x8c);
+        CogVRAssist.damage = *(int *) (c->Ebp + 0x14);
+        CogVRAssist.attempts++;
+    }
+    c->Eax = 0;
+    c->EFlags = (c->EFlags & ~0x8c5UL) | 0x44UL; /* xor eax,eax: CF/OF/SF=0, ZF/PF=1 */
+    c->Eip = 0x5f0f85;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static int
+CogVRAssist_Offline(void)
+{
+    const char *profile = SDL12COMPAT_getenv_unsafe("COGVR_ASSIST_PROFILE");
+    char path[600], options[4096];
+    HANDLE f;
+    DWORD n = 0;
+    if (!profile || !*profile) { return 0; }
+    SDL20_snprintf(path, sizeof (path), "%s\\user\\discord.txt", profile);
+    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) { return 0; }
+    SDL20_snprintf(path, sizeof (path), "%s\\user\\options.cfg", profile);
+    f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) { return 0; }
+    if (!ReadFile(f, options, sizeof (options) - 1, &n, NULL)) { n = 0; }
+    CloseHandle(f);
+    options[n] = 0;
+    return SDL20_strstr(options, "\nuploadScores=0\n") &&
+           SDL20_strstr(options, "\nnewsUpdates=0\n") &&
+           SDL20_strstr(options, "\nreportErrors=0\n");
+}
+
+static int
+CogVRAssist_Fingerprint(void)
+{
+    static const Uint8 gate[] = { 0xc6,0x05,0xcc,0xfa,0xce,0,1 };
+    static const Uint8 god[] = { 0x0f,0xb6,0x95,0x8f,0xf2,0xff,0xff,0x85,0xd2,0x74,0x12,
+        0x0f,0xb6,0x05,0x0b,0xfb,0xce,0,0x85,0xc0,0x74,7,0x33,0xc0,0xe9,0xde,0xb9,0,0 };
+    static const Uint8 player[] = { 0x55,0x8b,0xec,0x51,0x89,0x4d,0xfc,0x8b,0x45,0xfc,0x8a,0x40,0x50,0x8b,0xe5,0x5d,0xc3 };
+    static const Uint8 gm[] = { 0x55,0x8b,0xec,0x51,0x89,0x4d,0xfc,0x8b,0x45,0xfc,0xc6,0x40,0x10,1,0x8b,0xe5,0x5d,0xc3 };
+    static const Uint8 core[] = { 0xc7,0x80,0x8c,0,0,0,0,0,0,0 };
+    static const Uint8 turn[] = { 0x55,0x8b,0xec,0x51,0x89,0x4d,0xfc,0x8b,0x4d,0xfc,
+        0x81,0xc1,0x5c,6,0,0,0xe8,0x2b,0x31,0x55,0,0x8b,0xc8,0xe8,4,0xa3,0xff,0xff,0x8b,0xe5,0x5d,0xc3 };
+    const Uint8 *image = (const Uint8 *) GetModuleHandleA(NULL);
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *) image;
+    const IMAGE_NT_HEADERS *nt;
+    if ((UINT_PTR) image != 0x400000 || dos->e_magic != IMAGE_DOS_SIGNATURE) { return 0; }
+    nt = (const IMAGE_NT_HEADERS *) (image + dos->e_lfanew);
+    return nt->Signature == IMAGE_NT_SIGNATURE && nt->FileHeader.Machine == IMAGE_FILE_MACHINE_I386 &&
+           nt->OptionalHeader.SizeOfImage == 0x945000 &&
+           CogVRAssist_Match(0x78b037, gate, sizeof (gate)) &&
+           CogVRAssist_Match(0x5e558a, god, sizeof (god)) &&
+           CogVRAssist_Match(0x46dd90, player, sizeof (player)) &&
+           CogVRAssist_Match(0x470be0, gm, sizeof (gm)) &&
+           CogVRAssist_Match(0x5e8890, core, sizeof (core)) &&
+           CogVRAssist_Match(0x464270, turn, sizeof (turn));
+}
+
+static int
+CogVRAssist_Turn(void)
+{
+    typedef int (__attribute__((thiscall)) *GetTurn)(void *);
+    return ((GetTurn) 0x464270)(*(void **) 0xcefc4c);
+}
+
+static int
+CogVRAssist_Poll(double now)
+{
+    if (!CogVRAssist.init) {
+        const char *v = SDL12COMPAT_getenv_unsafe("COGVR_OFFLINE_ASSIST");
+        CogVRAssist.init = 1;
+        CogVRAssist.on = v && !SDL20_strcmp(v, "god");
+        if (CogVRAssist.on && (!CogVRAssist_Offline() || !CogVRAssist_Fingerprint())) {
+            CogVRAssist.stage = -1;
+            CogVRRec_Event("assist: REFUSED offline profile or GPU retail fingerprint; autopilot: done (assist refused)");
+        }
+    }
+    if (!CogVRAssist.on) { return 0; }
+    if (CogVRAssist.stage < 0) { return 1; }
+    if (!CogVRScr.haveLoc || now < CogVRAssist.next) { return 1; }
+    if (!CogVRAssist.stage) {
+        CogVRAssist.thread = GetCurrentThreadId();
+        *(Uint8 *) 0xcefacc = 1; /* unlock gate only; normal input sets real wizard flags/counters */
+        InterlockedExchange(&CogVRRehearsalWizard, 1);
+        CogVRRec_Event("assist: OFFLINE WIZARD rehearsal requested; god-mode; AI/map generation/FX enabled; uploads/news/errors disabled");
+        CogVRAssist.stage = 4;
+        CogVRAssist.next = now + 2500.0;
+        return 1;
+    }
+    if (CogVRAssist.stage == 4) {
+        CogVRBridge_Key(SDLK12_PERIOD); /* normal wait: establish a live base-screen turn before debug input */
+        CogVRAssist.stage = 5;
+        CogVRAssist.next = now + 600.0;
+        return 1;
+    }
+    if (CogVRAssist.stage == 5) {
+        CogVRBridge_KeyEx(SDLK12_d, KMOD12_LSHIFT | KMOD12_LALT, 'D');
+        CogVRAssist.stage = 1;
+        CogVRAssist.next = now + 500.0;
+        return 1;
+    }
+    if (CogVRAssist.stage == 1) {
+        CogVRBridge_KeyEx(SDLK12_d, KMOD12_LSHIFT | KMOD12_LALT, 'D');
+        CogVRAssist.stage = 2;
+        CogVRAssist.next = now + 500.0;
+        return 1;
+    }
+    if (CogVRAssist.stage == 2) {
+        const UINT_PTR gm = *(UINT_PTR *) 0xcefaa8;
+        DWORD old, ignored;
+        if (!gm || !*(Uint8 *) 0xcf4628 || !*(Uint8 *) (gm + 0x10) ||
+            *(Uint8 *) 0xcefb0e || !AddVectoredExceptionHandler(1, CogVRAssist_Damage) ||
+            !VirtualProtect((void *) 0x5e55a0, 1, PAGE_EXECUTE_READWRITE, &old)) {
+            CogVRAssist.stage = -1;
+            CogVRRec_Event("assist: REFUSED wizard flags pd=%d gm=%d no_ai=%d winerr=%lu; autopilot: done (assist refused)",
+                (int) *(Uint8 *) 0xcf4628, gm ? (int) *(Uint8 *) (gm + 0x10) : -1,
+                (int) *(Uint8 *) 0xcefb0e, (unsigned long) GetLastError());
+            return 1;
+        }
+        *(Uint8 *) 0x5e55a0 = 0xcc;
+        VirtualProtect((void *) 0x5e55a0, 1, old, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), (void *) 0x5e55a0, 1);
+        *(Uint8 *) 0xcefb0b = 1;
+        *(Uint8 *) 0xcefacc = 0;
+        CogVRAssist.stage = 3;
+        CogVRRec_Event("assist: ACTIVE real PlayerData+0x50=1 GM+0x10=1 god=1 no_ai=0; retail damage-return observer installed");
+    }
+    if (CogVRAssist.attempts > (unsigned) CogVRAssist.reported && CogVRAssist.world == *(UINT_PTR *) 0xcefc4c) {
+        CogVRRec_Event("assist: damage attempt %u amount=%d core_before=%d core_after=%d engine_turn=%d hud_turn=%d",
+            CogVRAssist.attempts, CogVRAssist.damage, CogVRAssist.before,
+            *(int *) (CogVRAssist.entity + 0x8c), CogVRAssist_Turn(), CogVRScr.turn);
+        CogVRAssist.reported = (int) CogVRAssist.attempts;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* autopilot                                                                                                      */
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -466,6 +632,9 @@ static struct {
     int known, mapSeq, lastSeq;        /* lastSeq: map sequence number on which depth lastDepth was first seen, 0 not yet */
     int exitSeenX, exitSeenY;
     int doneLogged;
+    int completionProof;
+    int evolveTries;                   /* Returns sent to a window that appeared as the exit was taken */
+    double evolveAt;
     int prevCore;
     double histAt;
     Uint32 tick;                       /* gameTick of the latest snapshot */
@@ -726,6 +895,7 @@ CogVRAuto_Poll(void)
     if (!ap && !rec) { return; }
     CogVRScr_Parse(now);
     if (CogVRRec.on) { CogVRRec_Notes(); }
+    if (CogVRAssist_Poll(now)) { return; }
     if (!CogVRAuto.on || !CogVRAuto.W || !CogVRAuto.havePlayer || !CogVRScr.haveLoc) { return; }
     if (!CogVRAuto.started) {
         CogVRAuto.started = 1;
@@ -745,6 +915,21 @@ CogVRAuto_Poll(void)
         if (CogVRAuto.tick != CogVRAuto.seenTick) {
             CogVRAuto.seenTick = CogVRAuto.tick;
             CogVRAuto.tickAt = now;
+            CogVRAuto.evolveTries = 0;
+        } else if (CogVRAuto.targetExit && !CogVRScr.dead && (now - CogVRAuto.tickAt > 4000.0) &&
+                   (CogVRAuto.evolveTries < 6) && (now >= CogVRAuto.evolveAt)) {
+            /* climbing to a new depth opens EVOLUTION PARAMETERS (retail saves, then waits for CMD_EVOLVE_CONFIRM before it
+               builds the next map). Confirm needs every new slot applied first ("APPLY 2"): Right (CMD_EVOLVE_SLOT_INCREASE)
+               puts them on the selected slot type, Down (CMD_EVOLVE_SLOT_NEXT) moves on when that type will take no more,
+               Return (CMD_EVOLVE_CONFIRM) accepts. Ordinary keys, as a player at the screen would press them. */
+            CogVRAuto.evolveTries++;
+            CogVRAuto.evolveAt = now + 2500.0;
+            CogVRRec_Event("autopilot: no turn %.0f s after the exit: evolution screen, %sRight Right Return, try %d",
+                (now - CogVRAuto.tickAt) / 1000.0, CogVRAuto.evolveTries > 1 ? "Down " : "", CogVRAuto.evolveTries);
+            if (CogVRAuto.evolveTries > 1) { CogVRBridge_Key(SDLK12_DOWN); }
+            CogVRBridge_Key(SDLK12_RIGHT);
+            CogVRBridge_Key(SDLK12_RIGHT);
+            CogVRBridge_KeyEx(SDLK12_RETURN, 0, 13);
         } else if (CogVRScr.dead || (now - CogVRAuto.tickAt > 45000.0)) {
             CogVRAuto.done = CogVRAuto.gaveUp = 1;
             CogVRAuto.doneAt = now;
@@ -752,6 +937,22 @@ CogVRAuto_Poll(void)
         }
     }
     if (CogVRAuto.done) {
+        if (CogVRAssist.stage == 3 && !CogVRAuto.gaveUp) {
+            if (!CogVRAuto.completionProof && now - CogVRAuto.doneAt > 500.0) {
+                CogVRAuto.completionProof = 1;
+                CogVRRec_Event("checkpoint: Ctrl-F8 requested engine_turn=%d hud_turn=%d depth=%d map_seq=%d; retail save, NOT entire-engine snapshot",
+                    CogVRAssist_Turn(), CogVRScr.turn, CogVRScr.depth, CogVRAuto.mapSeq);
+                CogVRBridge_KeyEx(SDLK12_F8, KMOD12_LCTRL, 0);
+                return;
+            }
+            if (CogVRAuto.completionProof == 1 && now - CogVRAuto.doneAt > 1500.0) {
+                CogVRAuto.completionProof = 2;
+                CogVRRec_Event("proof: Shift-Alt-S retail stat dump requested engine_turn=%d hud_turn=%d depth=%d",
+                    CogVRAssist_Turn(), CogVRScr.turn, CogVRScr.depth);
+                CogVRBridge_KeyEx(SDLK12_s, KMOD12_LSHIFT | KMOD12_LALT, 'S');
+                return;
+            }
+        }
         if (!CogVRAuto.doneLogged && (now - CogVRAuto.doneAt > 4000.0)) {
             CogVRAuto.doneLogged = 1;
             CogVRRec_Flush();
@@ -807,7 +1008,7 @@ CogVRAuto_Poll(void)
         CogVRAuto.noTurnFs = 0;
     }
     if (CogVRScr.volley) {
-        if ((CogVRScr.hostiles > 0) && (now >= CogVRAuto.noFireUntil) && !CogVRAuto.targetExit) {
+        if (!CogVRAssist.on && (CogVRScr.hostiles > 0) && (now >= CogVRAuto.noFireUntil) && !CogVRAuto.targetExit) {
             /* the first 'f' picked a target and shows the volley: 'f' again fires it */
             CogVRAuto.shots++;
             CogVRAuto.noTurnFs++;
@@ -848,7 +1049,7 @@ CogVRAuto_Poll(void)
         return;
     }
     /* hostile robots in view: shoot ('f' = all weapons at the nearest target) while the way out is unknown; once it is known, run for it */
-    if ((CogVRScr.hostiles > 0) && (now >= CogVRAuto.noFireUntil) && !CogVRAuto.targetExit) {
+    if (!CogVRAssist.on && (CogVRScr.hostiles > 0) && (now >= CogVRAuto.noFireUntil) && !CogVRAuto.targetExit) {
         CogVRAuto.noTurnFs++;
         CogVRAuto.shots++;
         CogVRBridge_Key(SDLK12_f);

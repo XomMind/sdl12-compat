@@ -208,11 +208,30 @@ CogVRBridge_Init(void)
     }
 }
 
-/* one key press (down + up) as a keyboard would send it; mod/unicode for shifted symbols such as ':' and '>' */
+/* A modifier key itself going down or up (SDL 1.2 bits: shift 0x3, ctrl 0xc0, alt 0x300). */
+static void
+CogVRBridge_Modifier(SDL12Key sym, int mod, int down)
+{
+    SDL12_Event ev;
+    SDL20_zero(ev);
+    ev.type = down ? SDL12_KEYDOWN : SDL12_KEYUP;
+    ev.key.state = down ? SDL_PRESSED : SDL_RELEASED;
+    ev.key.keysym.sym = sym;
+    ev.key.keysym.mod = (unsigned int) mod;
+    PushEventIfNotFiltered(&ev);
+}
+
+/* One key press (down + up) as a keyboard would send it; mod/unicode for shifted symbols such as ':' and '>'.
+   Cogmind reads modifiers three ways: the event's mod, SDL_GetModState(), and its own record of the modifier keys'
+   down/up events (StatMind statmind_ipc.h Statmind_PushKey: Alt+F10 and Shift+Alt+D did nothing with mod bits
+   alone). So the modifiers are pressed as keys around the keystroke and released after it, in reverse order. */
 static void
 CogVRBridge_KeyEx(SDL12Key sym, int mod, int uni)
 {
     SDL12_Event ev;
+    if (mod & 0x0003) { CogVRBridge_Modifier(SDLK12_LSHIFT, mod, 1); }
+    if (mod & 0x00c0) { CogVRBridge_Modifier(SDLK12_LCTRL, mod, 1); }
+    if (mod & 0x0300) { CogVRBridge_Modifier(SDLK12_LALT, mod, 1); }
     SDL20_zero(ev);
     ev.type = SDL12_KEYDOWN; ev.key.state = SDL_PRESSED;
     ev.key.keysym.sym = sym;
@@ -222,6 +241,9 @@ CogVRBridge_KeyEx(SDL12Key sym, int mod, int uni)
     ev.type = SDL12_KEYUP; ev.key.state = SDL_RELEASED;
     ev.key.keysym.unicode = 0;
     PushEventIfNotFiltered(&ev);
+    if (mod & 0x0300) { CogVRBridge_Modifier(SDLK12_LALT, mod, 0); }
+    if (mod & 0x00c0) { CogVRBridge_Modifier(SDLK12_LCTRL, mod, 0); }
+    if (mod & 0x0003) { CogVRBridge_Modifier(SDLK12_LSHIFT, mod, 0); }
     if (CogVRBridge.log) { CogVR_Log("COGVR bridge: key=%d mod=%d", (int) sym, mod); }
 }
 

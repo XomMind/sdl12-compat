@@ -56,6 +56,9 @@ static struct {
     volatile LONG sky;                 /* published for the bridge (game thread) */
 } CogVRInteg;
 
+/* Game-thread rehearsal activation is consumed here on the render thread. */
+static volatile LONG CogVRRehearsalWizard;
+
 static void CogVR_Haptic(int h);
 static int CogMesh_JointWorld(const char *name, CogM4 *out);
 
@@ -342,6 +345,9 @@ CogVR_IntegPoll(void)
     const double now = CogGPU_Now();
     const char *why = "-";
     int sky = COGVR_SKY_NORMAL, i;
+    if (InterlockedCompareExchange(&CogVRRehearsalWizard, 0, 0)) {
+        CogVR_IntegGreen("rehearsal", "OFFLINE ASSIST god-mode; AI enabled", 0);
+    }
     if (CogVRInteg.open) {
         char buf[1024];
         int n;
